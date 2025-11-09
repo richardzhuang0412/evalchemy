@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import lm_eval.models
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
@@ -30,6 +31,7 @@ class MATH500Benchmark(BaseBenchmark):
         max_tokens: int = 32768,
         logger: Optional[logging.Logger] = None,
         system_instruction: Optional[str] = None,
+        n_repeat: int = 3,
     ):
         """
         Initialize MATH500 benchmark.
@@ -40,12 +42,14 @@ class MATH500Benchmark(BaseBenchmark):
             seed: Random seed for reproducibility. Default is [0, 1234, 1234, 1234] for lm-eval-harness.
             logger: Optional logger instance
             system_instruction: Optional system instruction for the model
+            n_repeat: Number of times to repeat the evaluation. Default is 3.
         """
         super().__init__(logger=logger, system_instruction=system_instruction)
         self.data_file = data_file
         self.debug = debug
         self.seed = seed
         self.max_new_tokens = max_tokens
+        self.n_repeat = n_repeat
 
     def generate_responses(self, model: LM) -> Dict[str, Any]:
         """
@@ -61,22 +65,26 @@ class MATH500Benchmark(BaseBenchmark):
         examples = self.load_questions()
 
         # Prepare instances for model
-        all_instances = []
+        all_outputs = []
         if isinstance(model, lm_eval.models.huggingface.HFLM):
             model_name = model.pretrained
         elif isinstance(model, lm_eval.models.openai_completions.OpenAIChatCompletion):
             model_name = str(f"openai/{model.model}")
         else:
             model_name = model.model_args["model"]
-        for idx, example in enumerate(examples):
-            messages = [
-                {"role": "user", "content": PROMPT.format(problem=example["problem"])},
-            ]
 
-            templated_messages = self._prepare_messages(messages, model)
+        for i in range(self.n_repeat):
+            all_instances = []
+            seed = [s + i for s in self.seed]
 
-            all_instances.append(
-                Instance(
+            for idx, example in enumerate(examples):
+                messages = [
+                    {"role": "user", "content": PROMPT.format(problem=example["problem"])},
+                ]
+
+                templated_messages = self._prepare_messages(messages, model)
+
+                instance = Instance(
                     "generate_until",
                     example,
                     (
@@ -85,24 +93,33 @@ class MATH500Benchmark(BaseBenchmark):
                             "do_sample": False,
                             "max_new_tokens": self.max_new_tokens,
                             "temperature": 0.7,
-                            "seed": self.seed,
+                            "seed": seed,
                         },
                     ),
                     idx,
                 )
-            )
 
-        # Generate model responses
-        self.logger.info("Generating responses for MATH500...")
-        outputs = self.compute(model, all_instances)
+                # Add repetition information to instance metadata
+                instance.repeat_idx = i
+                instance.metadata = {
+                    "problem_id": str(example["id"]) if "id" in example else str(idx),
+                    "expected_answer": str(example["answer"]),
+                }
+
+                all_instances.append(instance)
+
+            # Generate model responses
+            self.logger.info(f"Generating responses for MATH500 (repetition {i+1}/{self.n_repeat})...")
+            outputs = self.compute(model, all_instances)
+            all_outputs.append(outputs)
 
         # Return None early for non-primary ranks
         if model.rank != 0:
             return None
 
-        for example, output in zip(examples, outputs):
-            example["model_output"] = output
-            example["model_answer"] = self.extract_answer(output)
+        for example, outputs in zip(examples, zip(*all_outputs)):
+            example["model_outputs"] = list(outputs)
+            example["model_answers"] = [self.extract_answer(o) for o in outputs]
 
         return {"examples": examples}
 
@@ -114,14 +131,37 @@ class MATH500Benchmark(BaseBenchmark):
             return None
 
         examples = results["examples"]
-        total = len(examples)
-        solved = sum(is_equiv(str(example["answer"]), example["model_answer"]) for example in examples)
+        num_questions = len(examples)
+
+        # Calculate accuracy for each repetition
+        all_results = []
+        for i in range(self.n_repeat):
+            solved = sum(
+                [is_equiv(str(example["answer"]), str(example["model_answers"][i])) for example in examples]
+            )
+            all_results.append(
+                {
+                    "repetition": i + 1,
+                    "num_total": num_questions,
+                    "num_solved": solved,
+                    "accuracy": solved / num_questions,
+                }
+            )
+
+        # Calculate overall statistics
+        solved_avg = np.mean([result["num_solved"] for result in all_results])
+        accuracy_avg = np.mean([result["accuracy"] for result in all_results])
+        accuracy_std = np.std([result["accuracy"] for result in all_results])
+        accuracy_std_err = np.std([result["accuracy"] for result in all_results]) / np.sqrt(self.n_repeat)
 
         results.update(
             {
-                "num_total": total,
-                "num_solved": solved,
-                "accuracy": solved / total,
+                "num_total": num_questions,
+                "solved_avg": solved_avg,
+                "run_stats": all_results,
+                "accuracy_avg": accuracy_avg,
+                "accuracy_std_err": accuracy_std_err,
+                "num_repeat": self.n_repeat,
             }
         )
 
